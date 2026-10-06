@@ -32,7 +32,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SIGNATURE_SKEW_MS = 300_000
 MAX_BODY_BYTES = 256_000
 MESSAGE_MAX_CHARS = 4_000
@@ -157,8 +157,13 @@ class Bridge:
         self.hermes_key = require(config, "API_SERVER_KEY")
         self.description = config.get(
             "STARLINGS_AGENT_DESCRIPTION", "A Hermes agent: terminal, files, browser, memory and its own skills.")
-        self.locks: dict[str, threading.Lock] = {}
-        self.locks_guard = threading.Lock()
+        self.mcp_port = int(config.get("MCP_PROXY_PORT", "8791"))
+        # One turn at a time across every conversation: the MCP proxy names the
+        # person whose turn is running, and Hermes does not say which session a
+        # tool call belongs to. `actor` is that person, or None between turns.
+        self.turn_lock = threading.Lock()
+        self.actor: str | None = None
+        self.actor_file = Path(config.get("_CONFIG_DIR", str(DEFAULT_CONFIG.parent))) / "last-actor"
 
     def verified(self, headers, body: bytes) -> bool:
         """Fails closed: no timestamp, a stale one, or a wrong signature is a refusal."""
@@ -218,10 +223,13 @@ class Bridge:
             return
         thread_id = delivery["thread_id"]
         key = f"hermes:{delivery.get('message_id') or thread_id}"
-        with self.locks_guard:
-            lock = self.locks.setdefault(thread_id, threading.Lock())
-        # One turn at a time per conversation, so two messages answer in order.
-        with lock:
+        with self.turn_lock:
+            self.actor = str(delivery.get("sender_email") or "").lower() or None
+            if self.actor:
+                try:
+                    self.actor_file.write_text(self.actor)
+                except OSError:
+                    pass
             try:
                 session_id = "starlings-" + re.sub(r"[^A-Za-z0-9_-]", "-", thread_id)[:100]
                 status, _ = self.hermes("/api/sessions", {
@@ -240,6 +248,70 @@ class Bridge:
             except Exception as error:  # noqa: BLE001 — the person must hear that the turn failed
                 log.exception("turn.failed thread=%s", thread_id)
                 self.say(thread_id, f"I could not finish this turn: {error}", key)
+            finally:
+                self.actor = None
+
+    def mcp(self, body: bytes, headers) -> tuple[int, bytes, dict[str, str]]:
+        """Forward one MCP request to Starlings' agent door, signed as this agent for one person.
+
+        During a turn the person is the one who asked. Between turns only listing
+        is allowed (Hermes lists tools when it connects), named for the last
+        person who asked; a call that reads or does something is refused.
+        """
+        try:
+            parsed = json.loads(body or b"{}")
+        except ValueError:
+            return 400, b'{"error":"invalid json"}', {"content-type": "application/json"}
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        methods = {str(call.get("method", "")) for call in calls if isinstance(call, dict)}
+        listing = {"initialize", "notifications/initialized", "ping", "tools/list", "resources/list",
+                   "resources/templates/list", "prompts/list"}
+        actor = self.actor
+        if actor is None:
+            if not methods <= listing:
+                return self.mcp_refusal(calls, "Starlings tools work only inside a Starlings conversation, for the person who asked.")
+            try:
+                actor = self.actor_file.read_text().strip() or None
+            except OSError:
+                actor = None
+            if actor is None:
+                return self.mcp_refusal(calls, "Nobody has messaged this agent in Starlings yet.")
+        timestamp = str(int(time.time() * 1000))
+        forward = {
+            "content-type": "application/json",
+            "accept": headers.get("accept") or "application/json, text/event-stream",
+            "user-agent": f"starlings-hermes/{VERSION}",
+            "x-meet-agent": self.agent_email,
+            "x-meet-actor": actor,
+            "x-internal-key-id": self.agent_email,
+            "x-internal-timestamp": timestamp,
+            "x-internal-signature": hmac.new(
+                self.inbound_key.encode(), f"{timestamp}.{self.agent_email}.{actor}.".encode() + body, hashlib.sha256,
+            ).hexdigest(),
+        }
+        for name in ("mcp-session-id", "mcp-protocol-version"):
+            if headers.get(name):
+                forward[name] = headers[name]
+        request = urllib.request.Request(f"{self.origin}/mcp", data=body, method="POST", headers=forward)
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status, response.read(), self.mcp_headers(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), self.mcp_headers(error.headers)
+        except (urllib.error.URLError, TimeoutError) as error:
+            log.error("starlings.mcp.failed error=%s", error)
+            return 502, b'{"error":"Starlings did not answer"}', {"content-type": "application/json"}
+
+    @staticmethod
+    def mcp_headers(source) -> dict[str, str]:
+        return {name: source[name] for name in ("content-type", "mcp-session-id") if source and source.get(name)}
+
+    @staticmethod
+    def mcp_refusal(calls: list, message: str) -> tuple[int, bytes, dict[str, str]]:
+        errors = [{"jsonrpc": "2.0", "id": call.get("id"), "error": {"code": -32001, "message": message}}
+                  for call in calls if isinstance(call, dict) and "id" in call]
+        payload = errors if len(errors) != 1 else errors[0]
+        return 200, json.dumps(payload).encode(), {"content-type": "application/json"}
 
     def hermes_get(self, path: str) -> dict | None:
         request = urllib.request.Request(
@@ -312,6 +384,7 @@ def prompt_for(delivery: dict) -> str | None:
 
 def serve(args: argparse.Namespace) -> None:
     config = read_config(Path(args.config))
+    config["_CONFIG_DIR"] = str(Path(args.config).parent)
     bridge = Bridge(config)
     host = config.get("BRIDGE_HOST", "127.0.0.1")
     port = int(config.get("BRIDGE_PORT", "8790"))
@@ -357,6 +430,42 @@ def serve(args: argparse.Namespace) -> None:
             # Acknowledge inside Starlings' five seconds; the answer follows on its own route.
             threading.Thread(target=bridge.turn, args=(delivery,), daemon=True).start()
             return self.reply(202, {"accepted": True})
+
+    class McpHandler(BaseHTTPRequestHandler):
+        """Loopback only: Hermes' `starlings` MCP server points here (see README)."""
+        server_version = f"starlings-hermes/{VERSION}"
+
+        def log_message(self, fmt, *log_args):
+            log.info("mcp %s", fmt % log_args)
+
+        def do_POST(self):
+            if self.path.split("?")[0] != "/mcp":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("content-length") or 0)
+            if length > MAX_BODY_BYTES:
+                self.send_error(413)
+                return
+            status, body, headers = bridge.mcp(self.rfile.read(length), self.headers)
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            # Streamable HTTP lets a server decline the standalone event stream.
+            self.send_error(405)
+
+        def do_DELETE(self):
+            self.send_response(200)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+    mcp_server = ThreadingHTTPServer(("127.0.0.1", bridge.mcp_port), McpHandler)
+    threading.Thread(target=mcp_server.serve_forever, daemon=True).start()
+    log.info("MCP proxy on 127.0.0.1:%s/mcp", bridge.mcp_port)
 
     server = ThreadingHTTPServer((host, port), Handler)
     log.info("listening on %s:%s as %s in %s", host, port, bridge.agent_email, bridge.origin)
