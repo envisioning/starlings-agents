@@ -1,0 +1,11 @@
+[Unit]
+Description=Starlings bridge for Hermes
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/starlings-agents/hermes/bridge.py serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
