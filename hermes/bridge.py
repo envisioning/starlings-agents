@@ -32,7 +32,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 SIGNATURE_SKEW_MS = 300_000
 MAX_BODY_BYTES = 256_000
 MESSAGE_MAX_CHARS = 4_000
@@ -241,13 +241,59 @@ class Bridge:
                 log.exception("turn.failed thread=%s", thread_id)
                 self.say(thread_id, f"I could not finish this turn: {error}", key)
 
+    def hermes_get(self, path: str) -> dict | None:
+        request = urllib.request.Request(
+            f"{self.hermes_url}{path}",
+            headers={"authorization": f"Bearer {self.hermes_key}", "user-agent": f"starlings-hermes/{VERSION}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                value = json.loads(response.read() or b"{}")
+                return value if isinstance(value, dict) else None
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            return None
+
     def manifest(self) -> dict:
-        """What Starlings shows on the agent's card in Team. Never a secret."""
-        return {
+        """What Starlings shows on the agent's card in Team, read live from Hermes.
+
+        The model, the enabled toolsets, the skills and the scheduled jobs. Each
+        part is best effort: a Hermes endpoint that fails leaves that part out.
+        Never a secret: no key, token, prompt or job text beyond its name.
+        """
+        out: dict = {
             "description": self.description,
             "home_url": "https://hermes-agent.nousresearch.com/docs/",
+            "repo_url": "https://github.com/envisioning/starlings-agents",
             "version": VERSION,
         }
+        model = self.hermes_get("/api/model/options") or {}
+        if model.get("model"):
+            out["model"] = f"{model['model']} ({model['provider']})" if model.get("provider") else str(model["model"])
+        toolsets = (self.hermes_get("/v1/toolsets") or {}).get("data") or []
+        tools = [
+            {"name": str(row.get("name")), "description": str(row.get("description") or "")[:200]}
+            for row in toolsets
+            if isinstance(row, dict) and row.get("enabled") and row.get("name") and row.get("tools")
+        ]
+        if tools:
+            out["tools"] = tools[:50]
+        skills = (self.hermes_get("/v1/skills") or {}).get("data") or []
+        named = [
+            {"name": str(row.get("name")), **({"description": str(row["description"])[:200]} if row.get("description") else {})}
+            for row in skills
+            if isinstance(row, dict) and row.get("name")
+        ]
+        if named:
+            out["skills"] = named[:50]
+        jobs = (self.hermes_get("/api/jobs") or {}).get("jobs") or []
+        schedules = [
+            {"cron": str(job.get("schedule") or job.get("cron")), "description": str(job.get("name") or "")[:120]}
+            for job in jobs
+            if isinstance(job, dict) and (job.get("schedule") or job.get("cron"))
+        ]
+        if schedules:
+            out["schedules"] = schedules[:20]
+        return out
 
 
 def prompt_for(delivery: dict) -> str | None:
