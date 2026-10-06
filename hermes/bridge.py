@@ -32,7 +32,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SIGNATURE_SKEW_MS = 300_000
 MAX_BODY_BYTES = 256_000
 MESSAGE_MAX_CHARS = 4_000
@@ -184,6 +184,9 @@ class Bridge:
                 f"{self.origin}/api/internal/channel-events", data=body, method="POST",
                 headers={
                     "content-type": "application/json",
+                    # Named, never urllib's default: Cloudflare's browser check refuses
+                    # `Python-urllib` with a 403 (error 1010) before Starlings sees it.
+                    "user-agent": f"starlings-hermes/{VERSION}",
                     "x-internal-timestamp": timestamp,
                     "x-internal-signature": sign(self.inbound_key, timestamp, body),
                     "x-internal-key-id": self.agent_email,
